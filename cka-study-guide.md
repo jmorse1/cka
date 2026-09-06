@@ -88,97 +88,293 @@ That's ~10 GB RAM. Add a 4th node later purely as a "join this broken node" targ
 
 **Optional:** an NFS server VM (1 vCPU, 1 GB) for ReadWriteMany and reclaim-policy practice.
 
-### Build the golden template
+---
 
-On the Proxmox host:
+### Step 1 — Create the base VM
+
+Run all of this on the **Proxmox host**, as root.
 
 ```bash
+# Move to where Proxmox keeps downloadable images
 cd /var/lib/vz/template/iso
+
+# Download the Ubuntu 24.04 "Noble" cloud image. Cloud images are pre-built,
+# minimal, and designed to be configured at first boot by cloud-init —
+# no interactive installer to click through.
 wget https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img
 
+# Create an empty VM shell with ID 9000. No disk yet — we attach that next.
+#   --cpu host    passes your real CPU features through. The default kvm64 is
+#                 slower and occasionally trips container runtime checks.
 qm create 9000 --name ubuntu-2404-k8s --memory 4096 --cores 2 \
   --net0 virtio,bridge=vmbr0 --cpu host
+
+# Import the downloaded cloud image as a disk belonging to VM 9000.
 qm importdisk 9000 noble-server-cloudimg-amd64.img local-lvm
+
+# Attach that imported disk as scsi0 using the virtio-scsi controller
+# (best performance and TRIM support under Linux guests).
 qm set 9000 --scsihw virtio-scsi-pci --scsi0 local-lvm:vm-9000-disk-0
+
+# Add a cloud-init drive. This is a small virtual CD-ROM that Proxmox
+# generates on each boot, carrying the username, password, SSH keys and
+# network config you set with 'qm set'.
 qm set 9000 --ide2 local-lvm:cloudinit
+
+# Boot from the disk we just attached.
 qm set 9000 --boot c --bootdisk scsi0
+
+# Give the VM a serial console and make it the primary display.
+# Ubuntu cloud images expect this. NOTE: this means the default noVNC
+# console will render a blank screen — see Step 2.
 qm set 9000 --serial0 socket --vga serial0
+
+# Enable the QEMU guest agent so Proxmox can cleanly shut the VM down —
+# which matters for taking consistent snapshots later.
 qm set 9000 --agent enabled=1
+
+# Cloud images ship a tiny (~2GB) disk. Grow it to something usable.
 qm resize 9000 scsi0 +25G
-qm template 9000
 ```
 
-Clone and assign static IPs:
+### Step 2 — Set login credentials, then boot it
+
+**This is the step that has to happen before templating.** Ubuntu cloud images have **no password and no configured user** out of the box — the `ubuntu` account is only created and unlocked when cloud-init runs, and cloud-init only knows what to create because you told Proxmox here. Skip this and the console will never offer you a login prompt.
 
 ```bash
-qm clone 9000 201 --name cka-cp1 --full
-qm set 201 --ipconfig0 ip=192.168.1.201/24,gw=192.168.1.1 \
-  --ciuser ubuntu --sshkeys ~/.ssh/id_rsa.pub
-qm set 201 --memory 4096 --cores 2
-qm start 201
-# repeat for 202 (cka-w1), 203 (cka-w2)
+# Tell cloud-init which user to create and what password to set.
+# This is temporary — we delete it before templating.
+qm set 9000 --ciuser ubuntu --cipassword 'temp-password-here'
+
+# Install your SSH public key so you can log in without a password later.
+qm set 9000 --sshkeys ~/.ssh/id_rsa.pub
+
+# Boot it. First boot runs cloud-init, which creates the user, applies the
+# SSH key, expands the filesystem to fill the resized disk, and sets up networking.
+qm start 9000
 ```
 
-### Proxmox gotchas that will waste your evening
+Give it **30–60 seconds** for cloud-init to finish before trying to log in.
 
-1. **Duplicate machine-id / product_uuid.** Cloned VMs share these and `kubeadm` will refuse to join. Before converting to a template, run inside the VM:
-   ```bash
-   truncate -s 0 /etc/machine-id
-   rm -f /var/lib/dbus/machine-id
-   ln -s /etc/machine-id /var/lib/dbus/machine-id
-   ```
-   Verify after cloning: `sudo cat /sys/class/dmi/id/product_uuid` must differ per node.
-2. **Set CPU type to `host`.** Default `kvm64` is noticeably slower and occasionally trips container runtime checks.
-3. **Disable memory ballooning** (or set minimum = maximum). The kubelet gets very unhappy when RAM is pulled out from under it and you'll waste hours chasing a phantom problem.
-4. **Install `qemu-guest-agent`** in the template so Proxmox can cleanly shut down VMs for snapshots.
-5. **Swap.** Cloud images may enable zram or a swapfile. `swapoff -a` plus commenting the fstab entry, and check `systemctl list-units | grep -i swap`.
+**How to reach the console.** Because we set `--vga serial0`, the default noVNC console shows nothing. Use one of:
 
-### Node preparation (all nodes)
+- **Web UI:** select the VM → **Console** dropdown at top right → **xterm.js**
+- **Host shell:** `qm terminal 9000` — attaches to the serial console. Exit with `Ctrl+O`.
+- **SSH:** `ssh ubuntu@<ip>` once it has an address. Easiest option.
+
+If xterm.js sits blank, **press Enter once** — the serial console usually needs a keystroke before it paints the login prompt.
+
+Log in as `ubuntu` with the password you set.
+
+### Step 3 — Prepare the node (inside the VM)
+
+Do this **inside VM 9000**, before templating. Everything you install here gets baked into the template, so you do it once instead of three times.
 
 ```bash
-sudo swapoff -a
-sudo sed -i '/ swap / s/^/#/' /etc/fstab
+sudo -i   # become root for the rest of this section
+```
 
-cat <<EOF | sudo tee /etc/modules-load.d/k8s.conf
+**Disable swap.** The kubelet refuses to start with swap enabled (unless you explicitly opt in, which the exam does not).
+
+```bash
+# Turn swap off right now, for this boot.
+swapoff -a
+
+# Comment out any swap entry in fstab so it stays off across reboots.
+sed -i '/ swap / s/^/#/' /etc/fstab
+
+# Cloud images sometimes enable zram or a swapfile via a systemd unit
+# that fstab doesn't cover. Check for stragglers and disable what you find.
+systemctl list-units --type=swap --all
+```
+
+**Load kernel modules and set sysctls.** Kubernetes networking needs bridged traffic to be visible to iptables, and needs IP forwarding on.
+
+```bash
+# Register the two modules so they load automatically on every boot.
+#   overlay      — the filesystem containerd uses for image layers
+#   br_netfilter — makes bridged traffic traverse iptables rules
+cat <<EOF | tee /etc/modules-load.d/k8s.conf
 overlay
 br_netfilter
 EOF
-sudo modprobe overlay && sudo modprobe br_netfilter
 
-cat <<EOF | sudo tee /etc/sysctl.d/k8s.conf
+# Load them now too, so we don't have to reboot.
+modprobe overlay && modprobe br_netfilter
+
+# Persist the network sysctls Kubernetes requires.
+cat <<EOF | tee /etc/sysctl.d/k8s.conf
 net.bridge.bridge-nf-call-iptables  = 1
 net.bridge.bridge-nf-call-ip6tables = 1
 net.ipv4.ip_forward                 = 1
 EOF
-sudo sysctl --system
 
-# containerd
-sudo apt-get update && sudo apt-get install -y containerd
-sudo mkdir -p /etc/containerd
-containerd config default | sudo tee /etc/containerd/config.toml
-sudo sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
-sudo systemctl restart containerd
+# Apply all sysctl config files immediately.
+sysctl --system
 ```
 
-**Install v1.34, not v1.35.** Then your first real lab task is upgrading to v1.35 — which is an exam topic you'd otherwise never practice.
+**Install and configure containerd** — the container runtime (the CRI implementation) that the kubelet talks to.
 
 ```bash
-sudo apt-get install -y apt-transport-https ca-certificates curl gpg
+apt-get update && apt-get install -y containerd
+
+# containerd ships with no config file; generate the full default one.
+mkdir -p /etc/containerd
+containerd config default | tee /etc/containerd/config.toml
+
+# Switch the cgroup driver to systemd. This MUST match what the kubelet uses
+# (systemd is the kubelet default). A mismatch causes pods to fail in ways
+# that are genuinely painful to diagnose — worth knowing for the exam.
+sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+
+systemctl restart containerd
+```
+
+**Install the Kubernetes tools — deliberately at v1.34, not v1.35.** That way your first real lab exercise is a genuine `kubeadm upgrade` to v1.35, which is a graded exam topic you'd otherwise never practice.
+
+```bash
+# Prerequisites for adding an apt repo over HTTPS with a signing key.
+apt-get install -y apt-transport-https ca-certificates curl gpg
+
+# Download the signing key for the v1.34 package repo and convert it to
+# the binary format apt expects.
+mkdir -p /etc/apt/keyrings
 curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.34/deb/Release.key \
-  | sudo gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+  | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+
+# Add the repo, pinned to that key.
 echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.34/deb/ /' \
-  | sudo tee /etc/apt/sources.list.d/kubernetes.list
-sudo apt-get update && sudo apt-get install -y kubelet kubeadm kubectl
-sudo apt-mark hold kubelet kubeadm kubectl
+  | tee /etc/apt/sources.list.d/kubernetes.list
+
+apt-get update && apt-get install -y kubelet kubeadm kubectl
+
+# Pin the versions. Without this, a routine 'apt upgrade' will silently
+# bump your cluster components and break things. kubeadm upgrades are
+# supposed to be deliberate — this is real-world practice too.
+apt-mark hold kubelet kubeadm kubectl
 ```
 
-Bootstrap:
+### Step 4 — Clean up, then convert to a template
+
+Still inside the VM. This is the part that prevents the clone collisions.
 
 ```bash
-sudo kubeadm init --pod-network-cidr=192.168.0.0/16 --apiserver-advertise-address=192.168.1.201
-# Calico (has full NetworkPolicy support — Flannel does not, and you need it)
+# Wipe cloud-init's state so it runs fresh on every clone rather than
+# assuming it has already configured this machine.
+cloud-init clean --logs
+
+# Delete the SSH host keys. If you skip this, every node shares an identity
+# and you'll get host key fingerprint collisions when hopping between them.
+# They regenerate automatically on next boot.
+rm -f /etc/ssh/ssh_host_*
+
+# Blank the machine-id. This is the one that actually duplicates across
+# clones and it breaks 'kubeadm join'. Emptying it (not deleting it) tells
+# systemd to generate a fresh unique ID on first boot.
+truncate -s 0 /etc/machine-id
+rm -f /var/lib/dbus/machine-id
+ln -s /etc/machine-id /var/lib/dbus/machine-id
+
+history -c
+shutdown -h now
+```
+
+Back on the **Proxmox host**, once the VM has fully stopped:
+
+```bash
+# Remove the temporary password so clones don't inherit it.
+# From here on you log in with your SSH key.
+qm set 9000 --delete cipassword
+
+# Convert to a template. This makes the disk read-only and permanently
+# non-bootable — which is exactly why every change above had to come first.
+qm template 9000
+```
+
+> **Correction worth knowing:** you may see advice about duplicate `product_uuid` breaking `kubeadm join`. Proxmox assigns each VM its own SMBIOS UUID automatically, so that half isn't an issue here. It is **`/etc/machine-id`** that genuinely duplicates, and only if the VM was booted before templating — which yours was. Hence the cleanup above.
+
+### Step 5 — Clone the nodes
+
+```bash
+# Full clone (independent disk, not a linked clone — you want these
+# independent so snapshot rollbacks stay simple).
+qm clone 9000 201 --name cka-cp1 --full
+
+# Give it a static IP via cloud-init, plus your SSH key.
+# Adjust the subnet and gateway to match your LAN.
+qm set 201 --ipconfig0 ip=192.168.1.201/24,gw=192.168.1.1 \
+  --ciuser ubuntu --sshkeys ~/.ssh/id_rsa.pub
+
+# Control plane gets a bit more RAM than the workers.
+qm set 201 --memory 4096 --cores 2
+
+qm start 201
+
+# Repeat for the workers:
+#   qm clone 9000 202 --name cka-w1 --full
+#   qm set 202 --ipconfig0 ip=192.168.1.202/24,gw=192.168.1.1 --ciuser ubuntu --sshkeys ~/.ssh/id_rsa.pub
+#   qm set 202 --memory 2048 --cores 2 && qm start 202
+#   ...and 203 / cka-w2 the same way.
+```
+
+**Verify uniqueness before going further.** On each node:
+
+```bash
+cat /etc/machine-id              # must differ across all three nodes
+cat /sys/class/dmi/id/product_uuid   # must also differ (Proxmox handles this)
+hostname                          # should match the VM name
+```
+
+If `/etc/machine-id` comes back **empty on the template**, that's correct — systemd regenerates it on each clone's first boot. Empty in the template, unique after boot, is exactly the state you want.
+
+### Step 6 — Bootstrap the cluster
+
+On `cka-cp1`:
+
+```bash
+# Initialise the control plane.
+#   --pod-network-cidr must match what your CNI expects. 192.168.0.0/16 is
+#     Calico's default. Pick a range that does NOT overlap your LAN.
+#   --apiserver-advertise-address pins the API server to this node's IP
+#     rather than letting kubeadm guess on a multi-interface box.
+sudo kubeadm init --pod-network-cidr=192.168.0.0/16 \
+  --apiserver-advertise-address=192.168.1.201
+
+# Set up kubectl for your regular user (kubeadm prints these too).
+mkdir -p $HOME/.kube
+sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+sudo chown $(id -u):$(id -g) $HOME/.kube/config
+
+# Install Calico as the CNI. Nodes stay NotReady until a CNI is installed —
+# a symptom worth recognising, since it shows up in troubleshooting tasks.
+# Use Calico rather than Flannel: Flannel does not implement NetworkPolicy,
+# and NetworkPolicy is on the exam.
 kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/master/manifests/calico.yaml
 ```
+
+On each worker, run the `kubeadm join` command that `kubeadm init` printed. If you lost it:
+
+```bash
+# Regenerate a valid join command on the control plane.
+# Tokens expire after 24h — this is how you recover, and it's an exam-relevant trick.
+sudo kubeadm token create --print-join-command
+```
+
+Confirm everything landed:
+
+```bash
+kubectl get nodes -o wide        # all three Ready
+kubectl get pods -A              # all system pods Running
+```
+
+### Proxmox gotchas that will waste your evening
+
+1. **Blank console.** Expected — `--vga serial0` means you need xterm.js or `qm terminal`, not noVNC. Press Enter to wake the prompt.
+2. **No login prompt / password rejected.** You didn't set `--ciuser`/`--cipassword` before first boot, or cloud-init hasn't finished. Set them, then `qm stop` and `qm start` (a reboot alone may not re-run cloud-init).
+3. **Duplicate `machine-id`.** Breaks `kubeadm join`. Fixed by Step 4.
+4. **Memory ballooning.** Disable it, or set minimum equal to maximum. The kubelet becomes very unhappy when RAM is pulled out from under it, and you'll waste hours chasing a phantom problem.
+5. **CPU type.** Use `host`. The default `kvm64` is slower and can trip runtime checks.
+6. **Swap creeping back.** Re-check after any template rebuild.
 
 ### Add-ons you need for full curriculum coverage
 
@@ -197,17 +393,27 @@ kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/master/m
 Once the cluster is healthy with add-ons installed:
 
 ```bash
-# On the Proxmox host — shut down ALL nodes first for a consistent snapshot
+# Shut down ALL nodes first. A snapshot of a running multi-node cluster
+# captures etcd mid-write and gives you an inconsistent restore.
 for id in 201 202 203; do qm shutdown $id; done
-# wait for all to stop, then:
-for id in 201 202 203; do qm snapshot $id clean-v134 --description "healthy cluster, pre-break"; done
+
+# Wait until all three show 'stopped', then snapshot each one.
+for id in 201 202 203; do
+  qm snapshot $id clean-v134 --description "healthy cluster, pre-break"
+done
+
 for id in 201 202 203; do qm start $id; done
 ```
 
 To restore after you've wrecked something:
 
 ```bash
-for id in 201 202 203; do qm stop $id; qm rollback $id clean-v134; qm start $id; done
+# Roll all three back together to the same point in time.
+for id in 201 202 203; do
+  qm stop $id
+  qm rollback $id clean-v134
+  qm start $id
+done
 ```
 
 **Always snapshot and restore all nodes together.** Restoring a single node into a cluster whose etcd has moved on gives you certificate and clock-skew errors that teach you nothing useful. After any rollback, give the cluster 2–3 minutes and check `kubectl get nodes` before concluding something is broken.
@@ -223,7 +429,7 @@ Assumes **8–10 hours/week**. Compress to 6 weeks at 15+ hrs/week if you alread
 **The 70/30 rule: at least 70% of every session is hands-on in a terminal.** Watching videos feels like progress and isn't. If you finish a study session without having typed `kubectl` fifty times, that session didn't count.
 
 ### Week 0 — Lab build
-Everything in Phase 0. End state: 3-node cluster on v1.34, Calico, snapshot taken. Also install `kubectl` locally and get your `.bashrc` and `.vimrc` set up (see §5).
+Everything in Phase 0. End state: 3-node cluster on v1.34, Calico, snapshot taken. Also set up your `.bashrc` and `.vimrc` (see §5).
 
 ### Week 1 — Architecture & kubectl fluency
 - Control plane components: what api-server, scheduler, controller-manager, etcd, kubelet, kube-proxy each actually do
@@ -233,7 +439,7 @@ Everything in Phase 0. End state: 3-node cluster on v1.34, Calico, snapshot take
 - **Drill:** recreate every core resource from imperative commands only. No copy-paste from docs.
 
 ### Week 2 — Workloads & Scheduling (15%)
-- Deployments: rolling update strategy, `maxSurge`/`maxUnavailable`, `rollout status/history/undo`, `--record` is deprecated — use annotations
+- Deployments: rolling update strategy, `maxSurge`/`maxUnavailable`, `rollout status/history/undo`
 - ReplicaSets, DaemonSets, StatefulSets, Jobs, CronJobs
 - Probes: liveness, readiness, startup — and what each one actually causes to happen
 - ConfigMaps and Secrets: as env vars, as volumes, `envFrom`, and what changes on update
@@ -259,7 +465,7 @@ Everything in Phase 0. End state: 3-node cluster on v1.34, Calico, snapshot take
 ### Week 5 — Storage (10%)
 - PV, PVC, binding, `storageClassName` matching
 - Access modes: RWO, ROX, RWX, RWOP — and which backends support which
-- Reclaim policies: Retain, Delete, Recycle(deprecated) — observe the actual behavior on PV deletion
+- Reclaim policies: Retain, Delete — observe the actual behavior on PV deletion
 - StorageClasses and **dynamic provisioning**; default StorageClass annotation
 - `volumeMounts`, `emptyDir`, `hostPath`, `subPath`
 - CSI conceptually: what a CSI driver is and where it fits
@@ -360,40 +566,66 @@ Snapshot first. Have someone else run the break if you can — or write each one
 The exam pre-configures `k` and completion, but muscle memory for the rest is worth building. In your lab's `~/.bashrc`:
 
 ```bash
+# Short alias — you'll type this hundreds of times in two hours.
 alias k=kubectl
+
+# Generate a manifest without contacting the cluster, so you can edit
+# rather than write YAML from scratch. Usage: k run nginx --image=nginx $do
 export do='--dry-run=client -o yaml'
+
+# Delete immediately instead of waiting out the 30s grace period.
 export now='--force --grace-period=0'
+
+# Tab completion for resource names, namespaces, and flags.
 source <(kubectl completion bash)
+
+# Make completion work through the 'k' alias too — it doesn't by default.
 complete -o default -F __start_kubectl k
 ```
 
 `~/.vimrc`:
 
 ```vim
-set expandtab
-set tabstop=2
-set shiftwidth=2
-set number
-set paste   " toggle off when typing normally
+set expandtab      " spaces, never tabs — YAML rejects tabs outright
+set tabstop=2      " a tab reads as 2 columns
+set shiftwidth=2   " indent/outdent by 2, the YAML convention
+set number         " line numbers, so error messages mean something
 ```
 
 Commands worth burning into your fingers:
 
 ```bash
+# Scaffold a single pod manifest.
 k run nginx --image=nginx $do > pod.yaml
+
+# Scaffold a 3-replica deployment.
 k create deploy web --image=nginx --replicas=3 $do > deploy.yaml
+
+# Scaffold a service in front of an existing deployment.
 k expose deploy web --port=80 --target-port=8080 --type=NodePort $do
+
+# ConfigMap and Secret from literal values.
 k create cm app --from-literal=KEY=value $do
 k create secret generic db --from-literal=pass=s3cr3t $do
+
+# RBAC: a namespaced role, then bind it to a ServiceAccount.
 k create role r1 --verb=get,list --resource=pods $do
 k create rolebinding rb1 --role=r1 --serviceaccount=default:sa1 $do
+
+# A one-shot Job.
 k create job j1 --image=busybox $do -- /bin/sh -c "echo hi"
+
+# Every pod in the cluster, with node placement, newest last.
 k get po -A -o wide --sort-by=.metadata.creationTimestamp
+
+# Cluster-wide event feed, most recent last — the fastest first move
+# on almost any "why is this broken" question.
 k get events -A --sort-by=.lastTimestamp
+
+# Look up field names without leaving the terminal. Often faster than
+# searching the docs, and it works when you can't recall the exact path.
 k explain deployment.spec.strategy --recursive
 ```
-
-`kubectl explain --recursive` is often faster than searching the docs. Use it constantly in practice so you reach for it under pressure.
 
 ---
 
@@ -501,4 +733,3 @@ Cluster and node failures (`journalctl -u kubelet`, `systemctl`, `crictl`) · co
 ---
 
 *Verify exam details at `training.linuxfoundation.org/certification/certified-kubernetes-administrator-cka/` before you register — the Kubernetes version tracks upstream releases and the curriculum is updated quarterly.*
-
