@@ -144,7 +144,7 @@ qm resize 9000 scsi0 +25G
 ```bash
 # Tell cloud-init which user to create and what password to set.
 # This is temporary — we delete it before templating.
-qm set 9000 --ciuser jay --cipassword 'temp-password-here'
+qm set 9000 --ciuser ubuntu --cipassword 'temp-password-here'
 
 # Install your SSH public key so you can log in without a password later.
 qm set 9000 --sshkeys ~/.ssh/id_rsa.pub
@@ -295,26 +295,38 @@ qm template 9000
 
 ### Step 5 — Clone the nodes
 
+> **Plan your three CIDRs before you type anything.** A Kubernetes cluster uses three separate address ranges and **none of them may overlap**. The examples below assume a LAN of `192.168.4.0/24`; substitute your own.
+>
+> | Range | Example | Notes |
+> |---|---|---|
+> | **LAN / node IPs** | `192.168.4.0/24` | Your real network |
+> | **Pod CIDR** | `10.244.0.0/16` | Set with `--pod-network-cidr` |
+> | **Service CIDR** | `10.96.0.0/12` | kubeadm default; spans `10.96.0.0`–`10.111.255.255` |
+>
+> Calico's documented default pod CIDR is `192.168.0.0/16`, which covers `192.168.0.0`–`192.168.255.255` and therefore **swallows any home LAN in the 192.168 range**. The failure is insidious: `kubeadm init` succeeds, then pods get addresses colliding with real hosts and connectivity fails intermittently later. Use `10.244.0.0/16` (or `172.16.0.0/16`) instead.
+
 ```bash
 # Full clone (independent disk, not a linked clone — you want these
 # independent so snapshot rollbacks stay simple).
-qm clone 9000 201 --name cka-cp1 --full
+qm clone 9000 701 --name cka-cp1 --full
 
 # Give it a static IP via cloud-init, plus your SSH key.
 # Adjust the subnet and gateway to match your LAN.
-qm set 201 --ipconfig0 ip=192.168.1.201/24,gw=192.168.1.1 \
-  --ciuser jay --sshkeys ~/.ssh/id_rsa.pub
+# NOTE: VM ID (701) and IP last octet (.201) intentionally differ here —
+# Proxmox doesn't care, but keep your own mapping consistent and written down.
+qm set 701 --ipconfig0 ip=192.168.4.201/24,gw=192.168.4.1 \
+  --ciuser ubuntu --sshkeys ~/.ssh/id_rsa.pub
 
 # Control plane gets a bit more RAM than the workers.
-qm set 201 --memory 4096 --cores 2
+qm set 701 --memory 4096 --cores 2
 
-qm start 201
+qm start 701
 
 # Repeat for the workers:
-#   qm clone 9000 202 --name cka-w1 --full
-#   qm set 202 --ipconfig0 ip=192.168.1.202/24,gw=192.168.1.1 --ciuser jay --sshkeys ~/.ssh/id_rsa.pub
-#   qm set 202 --memory 2048 --cores 2 && qm start 202
-#   ...and 203 / cka-w2 the same way.
+#   qm clone 9000 702 --name cka-w1 --full
+#   qm set 702 --ipconfig0 ip=192.168.4.202/24,gw=192.168.4.1 --ciuser ubuntu --sshkeys ~/.ssh/id_rsa.pub
+#   qm set 702 --memory 2048 --cores 2 && qm start 702
+#   ...and 703 / cka-w2 the same way.
 ```
 
 **Verify uniqueness before going further.** On each node:
@@ -331,25 +343,60 @@ If `/etc/machine-id` comes back **empty on the template**, that's correct — sy
 
 On `cka-cp1`:
 
+Before you start, note that `/etc/kubernetes/` on a prepared-but-uninitialised node contains **only** a `manifests/` directory holding an empty `.kubelet-keep` file. That placeholder ships with the `kubelet` package to stop dpkg removing the directory. No `admin.conf`, no `pki/`, no static pod manifests — all of those are created *by* `kubeadm init`. The kubelet will also be crash-looping, because it has no config to fetch yet. Both are normal at this point.
+
 ```bash
-# Initialise the control plane.
-#   --pod-network-cidr must match what your CNI expects. 192.168.0.0/16 is
-#     Calico's default. Pick a range that does NOT overlap your LAN.
+# Initialise the control plane. Tee the output — the join command and any
+# failure detail scroll past quickly and you'll want both.
+#   --pod-network-cidr is the range pods draw from. It must not overlap your
+#     LAN or the service CIDR. See the CIDR table in Step 5.
 #   --apiserver-advertise-address pins the API server to this node's IP
 #     rather than letting kubeadm guess on a multi-interface box.
-sudo kubeadm init --pod-network-cidr=10.244.0.0/16 \
-  --apiserver-advertise-address=192.168.1.201
+sudo kubeadm init \
+  --pod-network-cidr=10.244.0.0/16 \
+  --apiserver-advertise-address=192.168.4.201 \
+  2>&1 | tee ~/kubeadm-init.log
 
 # Set up kubectl for your regular user (kubeadm prints these too).
 mkdir -p $HOME/.kube
 sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
 sudo chown $(id -u):$(id -g) $HOME/.kube/config
+```
 
-# Install Calico as the CNI. Nodes stay NotReady until a CNI is installed —
-# a symptom worth recognising, since it shows up in troubleshooting tasks.
-# Use Calico rather than Flannel: Flannel does not implement NetworkPolicy,
+If init fails partway, clean up before retrying — a half-initialised node fails preflight on the second attempt:
+
+```bash
+sudo kubeadm reset -f        # tears down whatever partial state exists
+sudo rm -rf /etc/cni/net.d/  # stale CNI config confuses the next install
+rm -f $HOME/.kube/config     # stale credentials pointing at a dead cluster
+```
+
+Common preflight rejections: swap still on (`swapon --show` should print nothing), `br_netfilter` not loaded (`lsmod | grep br_netfilter`), containerd unreachable (`sudo crictl info` should return JSON), or port 6443 still bound from a failed run.
+
+Now install the CNI. **Always pin to a release tag.** The `master` branch is Calico's development branch: its manifests can be mid-refactor and mismatched against released images, which produces failures that look like cluster problems but aren't.
+
+```bash
+# Nodes stay NotReady until a CNI is installed — a symptom worth recognising,
+# since it shows up in troubleshooting tasks.
+# Calico rather than Flannel: Flannel does not implement NetworkPolicy,
 # and NetworkPolicy is on the exam.
-kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/master/manifests/calico.yaml
+# Check github.com/projectcalico/calico/releases for the current stable tag.
+curl -sL https://raw.githubusercontent.com/projectcalico/calico/v3.31.7/manifests/calico.yaml -o calico.yaml
+
+# Inspect before applying. If CALICO_IPV4POOL_CIDR is commented out, Calico
+# inherits the cluster's pod CIDR (what you passed to kubeadm) — which is what
+# you want. If it's set to 192.168.0.0/16, change it to 10.244.0.0/16.
+grep -A2 CALICO_IPV4POOL_CIDR calico.yaml
+
+kubectl apply -f calico.yaml
+kubectl -n kube-system rollout status deployment/calico-kube-controllers
+```
+
+Verify Calico actually used the range you intended, rather than assuming:
+
+```bash
+kubectl get ippools -o jsonpath='{.items[*].spec.cidr}'  # expect 10.244.0.0/16
+kubectl get pods -A -o wide                              # pod IPs in 10.244.x.x
 ```
 
 On each worker, run the `kubeadm join` command that `kubeadm init` printed. If you lost it:
@@ -372,16 +419,18 @@ kubectl get pods -A              # all system pods Running
 1. **Blank console.** Expected — `--vga serial0` means you need xterm.js or `qm terminal`, not noVNC. Press Enter to wake the prompt.
 2. **No login prompt / password rejected.** You didn't set `--ciuser`/`--cipassword` before first boot, or cloud-init hasn't finished. Set them, then `qm stop` and `qm start` (a reboot alone may not re-run cloud-init).
 3. **Duplicate `machine-id`.** Breaks `kubeadm join`. Fixed by Step 4.
-4. **Memory ballooning.** Disable it, or set minimum equal to maximum. The kubelet becomes very unhappy when RAM is pulled out from under it, and you'll waste hours chasing a phantom problem.
-5. **CPU type.** Use `host`. The default `kvm64` is slower and can trip runtime checks.
-6. **Swap creeping back.** Re-check after any template rebuild.
+4. **Calico IP autodetection picks the wrong NIC.** Calico defaults to `first-found`, which can latch onto a virtual or secondary interface. The `calico-node` log names the address it detected. Pin it: `kubectl -n kube-system set env daemonset/calico-node IP_AUTODETECTION_METHOD=can-reach=192.168.4.1` (or `interface=ens18`).
+5. **`calico-kube-controllers` in CrashLoopBackOff with `mkdir /status: permission denied`.** A manifest packaging fault, almost always from using the `master` branch. It writes health state to `/status` and its probes read it back; if the directory can't be created the probes fail and the kubelet kills a container that is otherwise working fine. Reinstall from a pinned tag. To unblock immediately: `kubectl -n kube-system patch deployment calico-kube-controllers -p '{"spec":{"template":{"spec":{"volumes":[{"name":"status","emptyDir":{}}],"containers":[{"name":"calico-kube-controllers","volumeMounts":[{"name":"status","mountPath":"/status"}]}]}}}}'`
+6. **Memory ballooning.** Disable it, or set minimum equal to maximum. The kubelet becomes very unhappy when RAM is pulled out from under it, and you'll waste hours chasing a phantom problem.
+7. **CPU type.** Use `host`. The default `kvm64` is slower and can trip runtime checks.
+8. **Swap creeping back.** Re-check after any template rebuild.
 
 ### Add-ons you need for full curriculum coverage
 
 | Add-on | Why you need it | Note |
 |---|---|---|
 | **metrics-server** | `kubectl top`, HPA | Patch with `--kubelet-insecure-tls` in a lab |
-| **MetalLB** | `type: LoadBalancer` services actually get an IP | Give it a small pool from your LAN subnet (192.168.4.240-192.168.4.250) |
+| **MetalLB** | `type: LoadBalancer` services actually get an IP | Pool must be **real routable LAN addresses outside your DHCP scope**, e.g. `192.168.4.240-192.168.4.250` |
 | **ingress-nginx** | Ingress resources | Pair with MetalLB |
 | **Gateway API CRDs + a controller** | New exam topic | NGINX Gateway Fabric is the easiest bare-metal option |
 | **local-path-provisioner** | Dynamic provisioning, StorageClasses | Rancher's; two-minute install |
@@ -395,21 +444,21 @@ Once the cluster is healthy with add-ons installed:
 ```bash
 # Shut down ALL nodes first. A snapshot of a running multi-node cluster
 # captures etcd mid-write and gives you an inconsistent restore.
-for id in 201 202 203; do qm shutdown $id; done
+for id in 701 702 703; do qm shutdown $id; done
 
 # Wait until all three show 'stopped', then snapshot each one.
-for id in 201 202 203; do
+for id in 701 702 703; do
   qm snapshot $id clean-v134 --description "healthy cluster, pre-break"
 done
 
-for id in 201 202 203; do qm start $id; done
+for id in 701 702 703; do qm start $id; done
 ```
 
 To restore after you've wrecked something:
 
 ```bash
 # Roll all three back together to the same point in time.
-for id in 201 202 203; do
+for id in 701 702 703; do
   qm stop $id
   qm rollback $id clean-v134
   qm start $id
@@ -497,6 +546,7 @@ This is the week that decides your score. Work exclusively from the break-fix li
 - Workload: `describe` events, `logs --previous`, `logs -c <container>`, exit codes, OOMKilled vs CrashLoopBackOff vs ImagePullBackOff
 - Networking: endpoints, DNS from inside a pod, NetworkPolicy blocking
 - Monitoring: `kubectl top nodes/pods`, container output streams
+- **A CrashLoopBackOff does not mean the process is failing.** A container whose logs look healthy can still be killed because its *probe* can't confirm it. When logs and errors disagree, `kubectl describe pod` and read the probe definitions and `Liveness probe failed` events. Distinguishing "the app is broken" from "the probe can't verify the app" is exam-grade skill.
 - **Build a personal triage checklist** and refine it all week. Mine would start: *is the node Ready? is the pod scheduled? is it running? does the service have endpoints? does DNS resolve?*
 
 ### Week 9 — Timed practice + Killer.sh session 1
