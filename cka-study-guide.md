@@ -522,14 +522,25 @@ Run all of this **from WSL** (Step 7) — every command here is a plain API call
 
 #### 8a. Helm
 
+Helm 4 went GA in November 2025 and is current; Helm 3 is in wind-down. Note that the widely-cited `get-helm-3` install script installs **Helm 3** — use the apt repo instead, which tracks the current major version.
+
 ```bash
-# Official install script. Helm is a single static binary — no cluster-side
-# component (Tiller was removed in Helm 3).
-curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
-chmod 700 get_helm.sh
-./get_helm.sh
+# Add Helm's signing key and apt repo.
+curl https://baltocdn.com/helm/signing.asc | gpg --dearmor \
+  | sudo tee /usr/share/keyrings/helm.gpg > /dev/null
+sudo apt-get install apt-transport-https --yes
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/helm.gpg] https://baltocdn.com/helm/stable/debian/ all main" \
+  | sudo tee /etc/apt/sources.list.d/helm-stable-debian.list
+sudo apt-get update && sudo apt-get install -y helm
+
+# Helm is a single static binary — no cluster-side component
+# (Tiller was removed back in Helm 3).
 helm version
 ```
+
+**Helm 4 notes that matter here.** New releases use **server-side apply**, while releases migrated from Helm 3 stay on client-side apply — irrelevant for a fresh lab, but it explains field-ownership conflicts if you ever mix them. The genuinely breaking changes are in registry login path components, post-renderers, and `--atomic`/`--force`/`--wait` flag behavior, all of which affect CI pipelines rather than interactive use. Chart `apiVersion: v2` renders unchanged.
+
+**For exam purposes this is low risk.** The subset the CKA tests — `repo add`, `install`, `upgrade`, `rollback`, `list`, `uninstall`, `template`, `--set`, `-f values.yaml`, `--dry-run` — behaves the same in both majors. If the exam image ships Helm 3, nothing you practice here will mislead you. Check with `helm version` on exam day out of habit.
 
 #### 8b. metrics-server
 
