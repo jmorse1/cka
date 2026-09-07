@@ -144,7 +144,7 @@ qm resize 9000 scsi0 +25G
 ```bash
 # Tell cloud-init which user to create and what password to set.
 # This is temporary — we delete it before templating.
-qm set 9000 --ciuser ubuntu --cipassword 'temp-password-here'
+qm set 9000 --ciuser jay --cipassword 'temp-password-here'
 
 # Install your SSH public key so you can log in without a password later.
 qm set 9000 --sshkeys ~/.ssh/id_rsa.pub
@@ -303,7 +303,7 @@ qm clone 9000 201 --name cka-cp1 --full
 # Give it a static IP via cloud-init, plus your SSH key.
 # Adjust the subnet and gateway to match your LAN.
 qm set 201 --ipconfig0 ip=192.168.1.201/24,gw=192.168.1.1 \
-  --ciuser ubuntu --sshkeys ~/.ssh/id_rsa.pub
+  --ciuser jay --sshkeys ~/.ssh/id_rsa.pub
 
 # Control plane gets a bit more RAM than the workers.
 qm set 201 --memory 4096 --cores 2
@@ -312,7 +312,7 @@ qm start 201
 
 # Repeat for the workers:
 #   qm clone 9000 202 --name cka-w1 --full
-#   qm set 202 --ipconfig0 ip=192.168.1.202/24,gw=192.168.1.1 --ciuser ubuntu --sshkeys ~/.ssh/id_rsa.pub
+#   qm set 202 --ipconfig0 ip=192.168.1.202/24,gw=192.168.1.1 --ciuser jay --sshkeys ~/.ssh/id_rsa.pub
 #   qm set 202 --memory 2048 --cores 2 && qm start 202
 #   ...and 203 / cka-w2 the same way.
 ```
@@ -337,7 +337,7 @@ On `cka-cp1`:
 #     Calico's default. Pick a range that does NOT overlap your LAN.
 #   --apiserver-advertise-address pins the API server to this node's IP
 #     rather than letting kubeadm guess on a multi-interface box.
-sudo kubeadm init --pod-network-cidr=192.168.0.0/16 \
+sudo kubeadm init --pod-network-cidr=10.244.0.0/16 \
   --apiserver-advertise-address=192.168.1.201
 
 # Set up kubectl for your regular user (kubeadm prints these too).
@@ -381,7 +381,7 @@ kubectl get pods -A              # all system pods Running
 | Add-on | Why you need it | Note |
 |---|---|---|
 | **metrics-server** | `kubectl top`, HPA | Patch with `--kubelet-insecure-tls` in a lab |
-| **MetalLB** | `type: LoadBalancer` services actually get an IP | Give it a small pool from your LAN subnet |
+| **MetalLB** | `type: LoadBalancer` services actually get an IP | Give it a small pool from your LAN subnet (192.168.4.240-192.168.4.250) |
 | **ingress-nginx** | Ingress resources | Pair with MetalLB |
 | **Gateway API CRDs + a controller** | New exam topic | NGINX Gateway Fabric is the easiest bare-metal option |
 | **local-path-provisioner** | Dynamic provisioning, StorageClasses | Rancher's; two-minute install |
