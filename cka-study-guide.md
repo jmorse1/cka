@@ -414,6 +414,200 @@ kubectl get nodes -o wide        # all three Ready
 kubectl get pods -A              # all system pods Running
 ```
 
+### Step 7 — Install the add-ons
+
+Without these, several curriculum domains are untestable in your lab. Install them in this order — MetalLB before ingress-nginx, and Gateway API CRDs before any gateway controller — because each depends on the one above it.
+
+| Add-on | Unlocks | Domain |
+|---|---|---|
+| **Helm** | Chart install/upgrade/rollback | Cluster Architecture (25%) |
+| **metrics-server** | `kubectl top`, HPA | Troubleshooting (30%), Workloads (15%) |
+| **local-path-provisioner** | StorageClasses, dynamic provisioning | Storage (10%) |
+| **MetalLB** | `type: LoadBalancer` gets a real IP | Services & Networking (20%) |
+| **ingress-nginx** | Ingress resources | Services & Networking (20%) |
+| **Gateway API + NGINX Gateway Fabric** | GatewayClass, Gateway, HTTPRoute | Services & Networking (20%) |
+| **NFS server** *(optional)* | ReadWriteMany, reclaim policies | Storage (10%) |
+
+Run all of this from `cka-cp1`. **Join your workers first** — several of these need somewhere to schedule, and the control plane carries a `NoSchedule` taint by default.
+
+#### 7a. Helm
+
+```bash
+# Official install script. Helm is a single static binary — no cluster-side
+# component (Tiller was removed in Helm 3).
+curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
+chmod 700 get_helm.sh
+./get_helm.sh
+helm version
+```
+
+#### 7b. metrics-server
+
+Nothing that consumes metrics works without this — `kubectl top` returns an error and every HPA sits at `<unknown>` targets.
+
+```bash
+helm repo add metrics-server https://kubernetes-sigs.github.io/metrics-server/
+helm repo update
+
+# --kubelet-insecure-tls is REQUIRED on a kubeadm cluster and is the single
+# most common reason metrics-server fails. The kubelet's serving certificate
+# is self-signed and not issued by the cluster CA, so metrics-server refuses
+# the connection until you tell it to skip verification. Fine in a lab;
+# in production you would fix the certs instead.
+helm install metrics-server metrics-server/metrics-server \
+  --namespace kube-system \
+  --set args="{--kubelet-insecure-tls}"
+
+# Metrics take 30-60s to populate. An empty result immediately after install
+# is normal, not a failure.
+sleep 60 && kubectl top nodes
+```
+
+#### 7c. local-path-provisioner
+
+Gives you a working StorageClass so PVCs bind dynamically instead of sitting `Pending` forever.
+
+```bash
+# Check github.com/rancher/local-path-provisioner/releases for the current
+# tag and substitute it below.
+kubectl apply -f https://raw.githubusercontent.com/rancher/local-path-provisioner/v0.0.31/deploy/local-path-storage.yaml
+
+kubectl get storageclass
+```
+
+**Deliberately leave it non-default at first.** Create a PVC with no `storageClassName` and watch it hang in `Pending` — that exact symptom is a recurring exam scenario. Once you've seen it, make it default:
+
+```bash
+# The is-default-class annotation is what lets a PVC omit storageClassName.
+kubectl patch storageclass local-path -p \
+  '{"metadata":{"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}'
+```
+
+#### 7d. MetalLB
+
+On bare metal there's no cloud controller, so `type: LoadBalancer` services stay `<pending>` forever. MetalLB hands out real LAN addresses.
+
+```bash
+helm repo add metallb https://metallb.github.io/metallb
+helm repo update
+helm install metallb metallb/metallb --namespace metallb-system --create-namespace
+
+kubectl -n metallb-system rollout status deployment/metallb-controller
+```
+
+The pool must be **real, routable addresses on your LAN that are outside your router's DHCP range** — otherwise your router will hand the same IPs to other devices and you'll chase intermittent conflicts.
+
+```bash
+cat <<EOF | kubectl apply -f -
+apiVersion: metallb.io/v1beta1
+kind: IPAddressPool
+metadata:
+  name: lab-pool
+  namespace: metallb-system
+spec:
+  addresses:
+  - 192.168.4.240-192.168.4.250
+---
+# L2Advertisement makes MetalLB answer ARP for those IPs. Without it the
+# addresses are assigned but unreachable — a good "service has an IP but
+# nothing connects" puzzle to have seen once.
+apiVersion: metallb.io/v1beta1
+kind: L2Advertisement
+metadata:
+  name: lab-l2
+  namespace: metallb-system
+spec:
+  ipAddressPools:
+  - lab-pool
+EOF
+```
+
+#### 7e. ingress-nginx
+
+```bash
+helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
+helm repo update
+
+# type=LoadBalancer makes the controller claim an address from MetalLB.
+helm install ingress-nginx ingress-nginx/ingress-nginx \
+  --namespace ingress-nginx --create-namespace \
+  --set controller.service.type=LoadBalancer
+
+# EXTERNAL-IP should show a MetalLB address, not <pending>.
+kubectl -n ingress-nginx get svc
+```
+
+Note the IngressClass name it registers (`nginx`) — that's what goes in `spec.ingressClassName` on your Ingress resources. Omitting it when no default IngressClass exists means the Ingress is silently ignored, which is worth experiencing once.
+
+#### 7f. Gateway API + a controller
+
+CRDs first, always. Controllers crash on startup if the CRDs they watch don't exist.
+
+```bash
+# Standard channel = GA/beta resources: GatewayClass, Gateway, HTTPRoute,
+# GRPCRoute, ReferenceGrant. That covers the exam; skip the experimental
+# channel. --server-side avoids the annotation size limit these large CRDs hit.
+kubectl apply --server-side -f \
+  https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.6.1/standard-install.yaml
+
+kubectl get crd | grep gateway
+```
+
+Then a controller that implements them. NGINX Gateway Fabric is the easiest on bare metal:
+
+```bash
+helm install ngf oci://ghcr.io/nginx/charts/nginx-gateway-fabric \
+  --create-namespace -n nginx-gateway \
+  --set service.type=LoadBalancer
+
+# A GatewayClass should now exist and report Accepted=True.
+kubectl get gatewayclass
+```
+
+If `GatewayClass` shows `Accepted=False`, the controller isn't running or the CRD version is ahead of what it supports — check `kubectl -n nginx-gateway logs deploy/ngf-nginx-gateway-fabric`.
+
+#### 7g. NFS server (optional, for ReadWriteMany)
+
+`local-path` is ReadWriteOnce only. If you want to practice RWX and reclaim policies against a real backend, stand up a small VM:
+
+```bash
+# On the NFS VM
+sudo apt-get install -y nfs-kernel-server
+sudo mkdir -p /srv/nfs/k8s && sudo chown nobody:nogroup /srv/nfs/k8s
+echo '/srv/nfs/k8s 192.168.4.0/24(rw,sync,no_subtree_check,no_root_squash)' \
+  | sudo tee -a /etc/exports
+sudo exportfs -ra
+
+# On every Kubernetes node — the client package must be present or mounts
+# fail with a confusing "wrong fs type" error.
+sudo apt-get install -y nfs-common
+```
+
+Then install the dynamic provisioner:
+
+```bash
+helm repo add nfs-subdir-external-provisioner \
+  https://kubernetes-sigs.github.io/nfs-subdir-external-provisioner/
+helm install nfs-provisioner \
+  nfs-subdir-external-provisioner/nfs-subdir-external-provisioner \
+  --set nfs.server=192.168.4.210 \
+  --set nfs.path=/srv/nfs/k8s
+```
+
+#### 7h. Verify, then snapshot
+
+```bash
+kubectl get nodes                      # all Ready
+kubectl get pods -A                    # everything Running
+kubectl top nodes                      # metrics-server alive
+kubectl get storageclass               # local-path present
+kubectl get gatewayclass               # Accepted=True
+kubectl -n ingress-nginx get svc       # EXTERNAL-IP assigned
+helm list -A                           # every release deployed
+```
+
+When all of that is green, **take a fresh snapshot of all three VMs** (see the snapshot workflow below) and name it something like `clean-v134-addons`. That becomes your restore point for the entire break-fix library.
+
 ### Proxmox gotchas that will waste your evening
 
 1. **Blank console.** Expected — `--vga serial0` means you need xterm.js or `qm terminal`, not noVNC. Press Enter to wake the prompt.
@@ -424,18 +618,6 @@ kubectl get pods -A              # all system pods Running
 6. **Memory ballooning.** Disable it, or set minimum equal to maximum. The kubelet becomes very unhappy when RAM is pulled out from under it, and you'll waste hours chasing a phantom problem.
 7. **CPU type.** Use `host`. The default `kvm64` is slower and can trip runtime checks.
 8. **Swap creeping back.** Re-check after any template rebuild.
-
-### Add-ons you need for full curriculum coverage
-
-| Add-on | Why you need it | Note |
-|---|---|---|
-| **metrics-server** | `kubectl top`, HPA | Patch with `--kubelet-insecure-tls` in a lab |
-| **MetalLB** | `type: LoadBalancer` services actually get an IP | Pool must be **real routable LAN addresses outside your DHCP scope**, e.g. `192.168.4.240-192.168.4.250` |
-| **ingress-nginx** | Ingress resources | Pair with MetalLB |
-| **Gateway API CRDs + a controller** | New exam topic | NGINX Gateway Fabric is the easiest bare-metal option |
-| **local-path-provisioner** | Dynamic provisioning, StorageClasses | Rancher's; two-minute install |
-| **NFS server VM + nfs-subdir provisioner** | ReadWriteMany, reclaim policies | Optional but worth it |
-| **Helm** | Exam topic | Install charts, template them, roll back releases |
 
 ### The snapshot workflow — your secret weapon
 
@@ -478,7 +660,7 @@ Assumes **8–10 hours/week**. Compress to 6 weeks at 15+ hrs/week if you alread
 **The 70/30 rule: at least 70% of every session is hands-on in a terminal.** Watching videos feels like progress and isn't. If you finish a study session without having typed `kubectl` fifty times, that session didn't count.
 
 ### Week 0 — Lab build
-Everything in Phase 0. End state: 3-node cluster on v1.34, Calico, snapshot taken. Also set up your `.bashrc` and `.vimrc` (see §5).
+Everything in Phase 0, Steps 1-7. End state: 3-node cluster on v1.34, Calico pinned to a release tag, all add-ons installed and verified, `clean-v134-addons` snapshot taken. Also set up your `.bashrc` and `.vimrc` (see §5).
 
 ### Week 1 — Architecture & kubectl fluency
 - Control plane components: what api-server, scheduler, controller-manager, etcd, kubelet, kube-proxy each actually do
