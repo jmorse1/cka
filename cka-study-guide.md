@@ -414,7 +414,97 @@ kubectl get nodes -o wide        # all three Ready
 kubectl get pods -A              # all system pods Running
 ```
 
-### Step 7 — Install the add-ons
+### Step 7 — Drive the cluster from WSL
+
+Running `kubectl` from a WSL Ubuntu instance on your workstation is more comfortable than working in a Proxmox console, and WSL2 reaches your LAN outbound without any special configuration. Do this before installing the add-ons in Step 8, since you will run all of those from here. Read the split-workflow warning at the end too — it decides how you practice.
+
+#### 7a. Copy the kubeconfig
+
+```bash
+# scp on admin.conf FAILS — it's mode 0600 owned by root, so the ubuntu user
+# can't read it. Pipe it through sudo on the remote side instead.
+mkdir -p ~/.kube
+ssh ubuntu@192.168.4.201 'sudo cat /etc/kubernetes/admin.conf' > ~/.kube/config
+chmod 600 ~/.kube/config
+
+kubectl get nodes
+```
+
+The `server:` field inside already points at `https://192.168.4.201:6443`, which is reachable from WSL2. Nothing here needs inbound access to WSL.
+
+**If you already have other clusters in `~/.kube/config`**, merge rather than overwrite:
+
+```bash
+ssh ubuntu@192.168.4.201 'sudo cat /etc/kubernetes/admin.conf' > ~/.kube/cka.conf
+
+# --flatten inlines the certs so the merged file stands alone.
+KUBECONFIG=~/.kube/config:~/.kube/cka.conf kubectl config view --flatten > ~/.kube/merged
+mv ~/.kube/merged ~/.kube/config && chmod 600 ~/.kube/config
+```
+
+```bash
+# kubeadm's default context name is unhelpful once you have more than one.
+kubectl config rename-context kubernetes-admin@kubernetes cka-lab
+kubectl config use-context cka-lab
+```
+
+#### 7b. Match kubectl to the cluster version
+
+Version skew beyond ±1 minor is unsupported. Your cluster is on v1.34 until you run the upgrade drill in Week 6, so install v1.34 here too.
+
+```bash
+sudo apt-get install -y apt-transport-https ca-certificates curl gpg
+sudo mkdir -p /etc/apt/keyrings
+curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.34/deb/Release.key \
+  | sudo gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.34/deb/ /' \
+  | sudo tee /etc/apt/sources.list.d/kubernetes.list
+sudo apt-get update && sudo apt-get install -y kubectl
+
+# Add the aliases and completion from section 5 to ~/.bashrc while you're here.
+```
+
+Install Helm in WSL too, not on the node — Steps 8a–8h are pure API calls and all work from here.
+
+#### 7c. WSL gotchas
+
+1. **Clock skew after the laptop sleeps.** WSL2's clock drifts from the Windows host on resume, and you get `x509: certificate has expired or is not yet valid` against a perfectly healthy cluster. The error points at certificates, so people burn real time on it. Fix: `sudo hwclock -s`.
+2. **Cluster rebuild invalidates your kubeconfig.** Any `kubeadm reset` + `init` generates a new CA, giving `x509: certificate signed by unknown authority`. Re-copy `admin.conf`. A *snapshot rollback* is fine — certs are restored with everything else.
+3. **`~/.kube/config` on the Windows filesystem.** Keep it in the WSL filesystem (`~`), not `/mnt/c/...`. The DrvFs mount can't represent Unix permissions, and kubectl warns about a world-readable config.
+
+#### 7d. The split-workflow warning
+
+**Roughly half the Troubleshooting domain — 30% of the exam — cannot be done from WSL at all.** Anything that touches the node itself needs a shell on the node:
+
+| Works from WSL | Requires SSH to the node |
+|---|---|
+| All resource CRUD, `describe`, `logs`, `exec` | `journalctl -u kubelet`, `systemctl status kubelet` |
+| Helm, Kustomize, all of Step 8 | `crictl ps` / `crictl logs` |
+| RBAC, `auth can-i` | Editing `/etc/kubernetes/manifests/` |
+| Port-forward, `top` | `etcdctl` backup and restore |
+| Everything in Weeks 2–5 | Every `kubeadm` command |
+| | Most of the break-fix library in §4 |
+
+This is not a limitation to work around — **it mirrors the exam**. The CKA is SSH-based: you start on a `base` host that has no tools installed, and each task tells you which node to `ssh` into. Points are routinely lost by running a command on the wrong host.
+
+So use WSL as your comfortable surface for resource work, but deliberately drill the `ssh cka-cp1` → work → `exit` cycle for anything node-level. Make it automatic:
+
+```bash
+# ~/.ssh/config in WSL — short names that match the exam's style
+Host cka-cp1
+    HostName 192.168.4.201
+    User ubuntu
+Host cka-w1
+    HostName 192.168.4.202
+    User ubuntu
+Host cka-w2
+    HostName 192.168.4.203
+    User ubuntu
+```
+
+Now `ssh cka-cp1` works the way `ssh node01` will on exam day. Note that **nested SSH is not supported in the exam** — always `exit` back before hopping elsewhere.
+
+### Step 8 — Install the add-ons
 
 Without these, several curriculum domains are untestable in your lab. Install them in this order — MetalLB before ingress-nginx, and Gateway API CRDs before any gateway controller — because each depends on the one above it.
 
@@ -428,9 +518,9 @@ Without these, several curriculum domains are untestable in your lab. Install th
 | **Gateway API + NGINX Gateway Fabric** | GatewayClass, Gateway, HTTPRoute | Services & Networking (20%) |
 | **NFS server** *(optional)* | ReadWriteMany, reclaim policies | Storage (10%) |
 
-Run all of this from `cka-cp1`. **Join your workers first** — several of these need somewhere to schedule, and the control plane carries a `NoSchedule` taint by default.
+Run all of this **from WSL** (Step 7) — every command here is a plain API call, so no SSH needed. **Join your workers first**: several of these need somewhere to schedule, and the control plane carries a `NoSchedule` taint by default.
 
-#### 7a. Helm
+#### 8a. Helm
 
 ```bash
 # Official install script. Helm is a single static binary — no cluster-side
@@ -441,7 +531,7 @@ chmod 700 get_helm.sh
 helm version
 ```
 
-#### 7b. metrics-server
+#### 8b. metrics-server
 
 Nothing that consumes metrics works without this — `kubectl top` returns an error and every HPA sits at `<unknown>` targets.
 
@@ -463,7 +553,7 @@ helm install metrics-server metrics-server/metrics-server \
 sleep 60 && kubectl top nodes
 ```
 
-#### 7c. local-path-provisioner
+#### 8c. local-path-provisioner
 
 Gives you a working StorageClass so PVCs bind dynamically instead of sitting `Pending` forever.
 
@@ -483,7 +573,7 @@ kubectl patch storageclass local-path -p \
   '{"metadata":{"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}'
 ```
 
-#### 7d. MetalLB
+#### 8d. MetalLB
 
 On bare metal there's no cloud controller, so `type: LoadBalancer` services stay `<pending>` forever. MetalLB hands out real LAN addresses.
 
@@ -522,7 +612,7 @@ spec:
 EOF
 ```
 
-#### 7e. ingress-nginx
+#### 8e. ingress-nginx
 
 ```bash
 helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
@@ -539,7 +629,7 @@ kubectl -n ingress-nginx get svc
 
 Note the IngressClass name it registers (`nginx`) — that's what goes in `spec.ingressClassName` on your Ingress resources. Omitting it when no default IngressClass exists means the Ingress is silently ignored, which is worth experiencing once.
 
-#### 7f. Gateway API + a controller
+#### 8f. Gateway API + a controller
 
 CRDs first, always. Controllers crash on startup if the CRDs they watch don't exist.
 
@@ -566,7 +656,7 @@ kubectl get gatewayclass
 
 If `GatewayClass` shows `Accepted=False`, the controller isn't running or the CRD version is ahead of what it supports — check `kubectl -n nginx-gateway logs deploy/ngf-nginx-gateway-fabric`.
 
-#### 7g. NFS server (optional, for ReadWriteMany)
+#### 8g. NFS server (optional, for ReadWriteMany)
 
 `local-path` is ReadWriteOnce only. If you want to practice RWX and reclaim policies against a real backend, stand up a small VM:
 
@@ -594,7 +684,7 @@ helm install nfs-provisioner \
   --set nfs.path=/srv/nfs/k8s
 ```
 
-#### 7h. Verify, then snapshot
+#### 8h. Verify, then snapshot
 
 ```bash
 kubectl get nodes                      # all Ready
@@ -660,7 +750,7 @@ Assumes **8–10 hours/week**. Compress to 6 weeks at 15+ hrs/week if you alread
 **The 70/30 rule: at least 70% of every session is hands-on in a terminal.** Watching videos feels like progress and isn't. If you finish a study session without having typed `kubectl` fifty times, that session didn't count.
 
 ### Week 0 — Lab build
-Everything in Phase 0, Steps 1-7. End state: 3-node cluster on v1.34, Calico pinned to a release tag, all add-ons installed and verified, `clean-v134-addons` snapshot taken. Also set up your `.bashrc` and `.vimrc` (see §5).
+Everything in Phase 0, Steps 1-8. End state: 3-node cluster on v1.34, Calico pinned to a release tag, all add-ons installed and verified, `clean-v134-addons` snapshot taken, kubectl working from WSL with SSH host aliases configured. Also set up your `.bashrc` and `.vimrc` (see §5).
 
 ### Week 1 — Architecture & kubectl fluency
 - Control plane components: what api-server, scheduler, controller-manager, etcd, kubelet, kube-proxy each actually do
